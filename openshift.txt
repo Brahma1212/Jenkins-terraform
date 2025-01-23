@@ -1,0 +1,897 @@
+@Library('conduit@latest') _
+
+String shortApplicationName = 'cms-file-processor'
+String applicationName = "gov-solutions-dmom-$shortApplicationName"
+env.SHORT_APPLICATION_NAME = shortApplicationName
+env.APPLICATION_NAME = applicationName
+
+String registry = 'registry.cigna.com'
+String registryDev = 'registry.cigna.com'
+String registryOrg = 'transactionhub'
+
+//TODO: update application version before each release
+env.APPLICATION_VERSION = '0.0.6'
+def branchPattern = 'feature.*|stage|develop|master|pvs|mo.*'
+
+// Creating place holders for vars within SWITCH statement
+def kanikoRegistry = ""
+def kanikoCred = ""
+def helmCred = ""
+
+// This is for registry login info when pushing to Quay
+switch(env.BRANCH_NAME) {
+    case ["develop", "pvs", "stage"]:
+        kanikoRegistry = "registry-dev.cigna.com"
+        kanikoCred = 'helm-transaction-registry-token-dev'
+        helmCred = "openshift-credentials-non-prod"
+        break
+    case ~/feature.*/:
+        kanikoRegistry = "registry-dev.cigna.com"
+        kanikoCred = 'helm-transaction-registry-token-dev'
+        helmCred = 'openshift-credentials-non-prod'
+        break
+    case ~/release.*/:
+        kanikoRegistry = "registry-dev.cigna.com"
+        kanikoCred = 'helm-transaction-registry-token-dev'
+        helmCred = "openshift-credentials-non-prod"
+        break
+    default:
+        kanikoRegistry = "registry.cigna.com"
+        kanikoCred = 'registry-token-prod'
+        helmCred = "openshift-credentials-prod"
+        break
+}
+
+
+cignaBuildFlow {
+    githubConnectionName = 'cigna-github'
+    cloudName = 'us-med-gov-intsvc-dev-openshift-devops1'
+    phases = [
+        [
+            buildType           : 'maven',
+            veracodeEnabled     : false,
+            branchPattern       : 'feature.*|release.*|develop|pvs|master',
+            containers          : [
+                [
+                    name           : 'maven',
+                    image          : 'registry.cigna.com/docker.io/maven',
+                    version        : '3.6-jdk-11',
+                    imagePullPolicy: 'Always',
+                ],
+            ],
+            maven               : [
+                hasSnapshotVersion: true,
+                authSettings      : true,
+                alterVersions     : true,
+                debug             : false,
+            ],
+            junit               : [
+                testResults: 'target/surefire-reports/*.xml'
+            ],
+            sonarQube           : [
+                credentialsId     : 'sonarqube-service-id',
+                mainBranch        : 'develop',
+                scannerOptions    : '-Xmx1536m',
+                containerMaxMemory: '2Gi',
+                scannerProperties : [
+                    'sonar.projectKey=$APPLICATION_NAME',
+                    'sonar.sources=src/main/java',
+                    'sonar.tests=src/test/java',
+                    'sonar.java.binaries=target/',
+                    'sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml',
+                    'sonar.junit.reportPaths=target/surefire-reports/*.xml'
+                ],
+            ],
+            artifactory         : [
+                credentialsId: 'artifactory_service_id'
+            ],
+            checkmarx           : [
+                credentialsId: 'checkmarx-service-creds',
+                settings     : [
+                    CX_PROJECT_TEAM_NAME: 'transactionhub',
+                    CX_SCAN_TYPE        : 'AsyncScan',
+                ]
+            ],
+        ],
+        [
+            packagingType     : 'kaniko',
+            branchPattern     : branchPattern,
+            dockerRegistry    : "${kanikoRegistry}",
+            dockerfile        : 'Dockerfile',
+            conftestValidation: false,
+            image             : [
+                org : 'transactionhub',
+                name: applicationName,
+                tags: [
+                    [
+                        tag   : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT',
+                        expire: true
+                    ],
+                    [
+                        tag   : '$APPLICATION_VERSION',
+                        expire: true
+                    ],
+                    [
+                        tag   : '$GIT_COMMIT_SHORT',
+                        expire: true
+                    ]
+                ]
+            ],
+            quay              : [
+                credentialsId: "${kanikoCred}"
+            ]
+        ],
+
+        [
+            deploymentType        : 'helm',
+            branchPattern         : 'feature.*',
+            sdlcEnvironment       : 'dev',
+            isProductionDeployment: false,
+            vault                 : [
+                credentialsId: 'cms-processor-vault-nonprod',
+                files        : [
+                    "$applicationName-pkg/values/dev/dmom-cms-secrets.yaml.enc",
+                ]
+            ],
+            helm                  : [
+                serverUrl     : 'https://api.gp-1-nonprod.openshift.cignacloud.com:6443',
+                namespace     : 'transaction-hub-dev',
+                credentialsId : "$helmCred",
+                oscpLDAPAuth  : true,
+
+                chart         : "$applicationName-pkg",
+                deploymentName: applicationName,
+                setValues     : [
+                    'applicationName': applicationName,
+                    'imageRepository': "$kanikoRegistry/$registryOrg/$applicationName",
+                    'imageTag'       : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT'
+                ],
+                values        : [
+                    "$applicationName-pkg/values/values.yaml",
+                     "$applicationName-pkg/values/dev/dmom-cms-secrets.yaml",
+                    "$applicationName-pkg/values/dev/cmsFileConfig.yaml",
+                    "$applicationName-pkg/values/dev/common.yaml",
+                ],
+                historyMax    : 1
+             ]
+        ],
+
+        [
+                    deploymentType        : 'helm',
+                    branchPattern         : 'develop',
+                    sdlcEnvironment       : 'sys',
+                    isProductionDeployment: false,
+                    vault                 : [
+                        credentialsId: 'cms-processor-vault-nonprod',
+                        files        : [
+                            "$applicationName-pkg/values/sys/dmom-cms-secrets.yaml.enc",
+                        ]
+                    ],
+                    helm                  : [
+                        serverUrl     : 'https://api.gp-1-nonprod.openshift.cignacloud.com:6443',
+                        namespace     : 'transaction-hub-sys',
+                        credentialsId : "$helmCred",
+                        oscpLDAPAuth  : true,
+
+                        chart         : "$applicationName-pkg",
+                        deploymentName: applicationName,
+                        setValues     : [
+                            'applicationName': applicationName,
+                            'imageRepository': "$kanikoRegistry/$registryOrg/$applicationName",
+                            'imageTag'       : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT'
+                        ],
+                        values        : [
+                            "$applicationName-pkg/values/values.yaml",
+                             "$applicationName-pkg/values/sys/dmom-cms-secrets.yaml",
+                            "$applicationName-pkg/values/sys/cmsFileConfig.yaml",
+                            "$applicationName-pkg/values/sys/common.yaml",
+                        ],
+                        historyMax    : 1
+                     ]
+        ],
+
+                [
+                            deploymentType        : 'helm',
+                            branchPattern         : 'pvs',
+                            sdlcEnvironment       : 'pvs',
+                            isProductionDeployment: false,
+                            vault                 : [
+                                credentialsId: 'cms-processor-vault-nonprod',
+                                files        : [
+                                    "$applicationName-pkg/values/pvs/dmom-cms-secrets.yaml.enc",
+                                ]
+                            ],
+                            helm                  : [
+                                serverUrl     : 'https://api.gp-1-pvs.openshift.cignacloud.com:6443',
+                                namespace     : 'transaction-hub-pvs',
+
+                                credentialsId : "$helmCred",
+                                oscpLDAPAuth  : true,
+
+                                chart         : "$applicationName-pkg",
+                                deploymentName: applicationName,
+                                setValues     : [
+                                    'applicationName': applicationName,
+                                    'imageRepository': "$kanikoRegistry/$registryOrg/$applicationName",
+                                    'imageTag'       : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT'
+                                ],
+                                values        : [
+                                    "$applicationName-pkg/values/values.yaml",
+                                     "$applicationName-pkg/values/pvs/dmom-cms-secrets.yaml",
+                                    "$applicationName-pkg/values/pvs/cmsFileConfig.yaml",
+                                    "$applicationName-pkg/values/pvs/common.yaml",
+                                ],
+                                historyMax    : 1
+                             ]
+                ],
+                [
+                            deploymentType        : 'helm',
+                            branchPattern         : 'release.*',
+                            sdlcEnvironment       : 'rlse',
+                            isProductionDeployment: false,
+                            vault                 : [
+                                credentialsId: 'cms-processor-vault-nonprod',
+                                files        : [
+                                    "$applicationName-pkg/values/rlse/dmom-cms-secrets.yaml.enc",
+                                ]
+                            ],
+                            helm                  : [
+                                serverUrl     : 'https://api.gp-1-rlse.openshift.cignacloud.com:6443',
+                                namespace     : 'transaction-hub-rlse',
+
+                                credentialsId : "$helmCred",
+                                oscpLDAPAuth  : true,
+
+                                chart         : "$applicationName-pkg",
+                                deploymentName: applicationName,
+                                setValues     : [
+                                    'applicationName': applicationName,
+                                    'imageRepository': "$kanikoRegistry/$registryOrg/$applicationName",
+                                    'imageTag'       : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT'
+                                ],
+                                values        : [
+                                    "$applicationName-pkg/values/values.yaml",
+                                    "$applicationName-pkg/values/rlse/dmom-cms-secrets.yaml",
+                                    "$applicationName-pkg/values/rlse/cmsFileConfig.yaml",
+                                    "$applicationName-pkg/values/rlse/common.yaml",
+                                ],
+                                historyMax    : 1
+                             ]
+                ],
+
+                [
+                            deploymentType        : 'helm',
+                            branchPattern         : 'master',
+                            sdlcEnvironment       : 'prod',
+                            isProductionDeployment: false,
+                            vault                 : [
+                                credentialsId: 'cms-processor-vault-prod',
+                                files        : [
+                                    "$applicationName-pkg/values/prod/dmom-cms-secrets.yaml.enc",
+                                ]
+                            ],
+                            helm                  : [
+                                serverUrl     : 'https://api.gp-1-prod.openshift.cignacloud.com:6443',
+                                namespace     : 'transaction-hub-prod',
+
+                                credentialsId : "$helmCred",
+                                oscpLDAPAuth  : true,
+
+                                chart         : "$applicationName-pkg",
+                                deploymentName: applicationName,
+                                setValues     : [
+                                    'applicationName': applicationName,
+                                    'imageRepository': "$kanikoRegistry/$registryOrg/$applicationName",
+                                    'imageTag'       : '$APPLICATION_VERSION-$GIT_COMMIT_SHORT'
+                                ],
+                                values        : [
+                                    "$applicationName-pkg/values/values.yaml",
+                                    "$applicationName-pkg/values/prod/dmom-cms-secrets.yaml",
+                                    "$applicationName-pkg/values/prod/cmsFileConfig.yaml",
+                                    "$applicationName-pkg/values/prod/common.yaml",
+                                ],
+                                historyMax    : 1
+                             ]
+                ]
+    ]
+}
+=======================================================================================================================
+ 
+Here's a detailed analysis and key points of the Jenkins pipeline script:
+ 
+1. Application Information:
+
+   - Short name: 'cms-file-processor'
+
+   - Full name: 'gov-solutions-dmom-cms-file-processor'
+
+   - Version: '0.0.6'
+ 
+2. Environment Configuration:
+
+   - Uses conditional logic to set up different environments based on branch names
+
+   - Environments: dev, sys, pvs, rlse, and prod
+
+   - Registry configuration:
+
+     * Dev/PVS/Stage: registry-dev.cigna.com
+
+     * Production: registry.cigna.com
+ 
+3. CI/CD Pipeline Structure:
+
+   - Utilizes the 'cignaBuildFlow' function
+
+   - Defines multiple phases for building, packaging, and deploying
+
+   - Each phase is tailored to specific stages of the development lifecycle
+ 
+4. Build Phase:
+
+   - Build Type: Maven
+
+   - JDK Version: 11
+
+   - Key Components:
+
+     * Veracode scanning (disabled)
+
+     * JUnit test reporting
+
+     * SonarQube analysis for code quality
+
+     * Artifactory integration for artifact management
+
+     * Checkmarx security scanning
+ 
+5. SonarQube Configuration:
+
+   - Main branch: 'develop'
+
+   - Custom scanner properties defined for Java project analysis
+
+   - Includes coverage and test result paths
+ 
+6. Packaging Phase:
+
+   - Uses Kaniko for container image building
+
+   - Applies to branches matching: 'feature.*|stage|develop|master|pvs|mo.*'
+
+   - Image tagging strategy:
+
+     * $APPLICATION_VERSION-$GIT_COMMIT_SHORT
+
+     * $APPLICATION_VERSION
+
+     * $GIT_COMMIT_SHORT
+ 
+7. Deployment Phase:
+
+   - Deployment Type: Helm
+
+   - Separate configurations for different environments (dev, sys, pvs, rlse, prod)
+
+   - Vault integration for secrets management
+
+   - OpenShift clusters used for deployment
+
+   - Environment-specific configurations:
+
+     * Namespace naming convention: 'transaction-hub-{env}'
+
+     * Different OpenShift API endpoints for each environment
+ 
+8. Helm Deployment Details:
+
+   - Uses a custom Helm chart: "$applicationName-pkg"
+
+   - Sets common values across deployments:
+
+     * applicationName
+
+     * imageRepository
+
+     * imageTag
+
+   - Environment-specific value files:
+
+     * Common configuration
+
+     * Secrets configuration
+
+     * CMS file configuration
+ 
+9. Security Measures:
+
+   - Vault integration for managing secrets
+
+   - OSCP LDAP authentication for OpenShift clusters
+
+   - Separate credentials for dev/non-prod and prod environments
+ 
+10. Branching Strategy:
+
+    - Feature branches: 'feature.*'
+
+    - Development: 'develop'
+
+    - Pre-production validation: 'pvs'
+
+    - Release branches: 'release.*'
+
+    - Production: 'master'
+ 
+11. Image Registry Strategy:
+
+    - Uses different registries for dev/non-prod (registry-dev.cigna.com) and prod (registry.cigna.com)
+
+    - Consistent image organization: '$registryOrg/$applicationName'
+ 
+12. Version Control:
+
+    - Uses Git for source control
+
+    - Utilizes short commit hash for image tagging
+ 
+This Jenkins pipeline script demonstrates a comprehensive CI/CD process, covering building, testing, security scanning, packaging, and deploying across multiple environments. It's designed to ensure consistency and reliability throughout the software delivery lifecycle for the 'cms-file-processor' application.
+ 
+name: CMS File Processor CI/CD
+ 
+variables:
+
+  APPLICATION_NAME: gov-solutions-dmom-cms-file-processor
+
+  APPLICATION_VERSION: 0.0.6
+ 
+stages:
+
+  - build
+
+  - package
+
+  - deploy
+ 
+build:
+
+  stage: build
+
+  script:
+
+    - mvn clean install
+
+    - mvn test
+
+    # Add SonarQube, Artifactory, and Checkmarx steps
+ 
+package:
+
+  stage: package
+
+  script:
+
+    # Add Kaniko build steps
+ 
+deploy:
+
+  stage: deploy
+
+  script:
+
+    # Add Helm deployment steps
+
+  rules:
+
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+      variables:
+
+        ENVIRONMENT: dev
+
+    # Add rules for other branches and environments
+ 
+ 
+To convert the Jenkins pipeline script to a YAML format, you'll need to follow these general steps:
+ 
+1. Choose a YAML-based CI/CD system:
+
+   - Popular options include GitLab CI/CD, GitHub Actions, or Azure DevOps Pipelines.
+ 
+2. Structure your YAML file:
+
+   - Start with defining the pipeline name and any global variables.
+
+   - Create stages that correspond to the phases in the Jenkins pipeline.
+ 
+3. Convert job definitions:
+
+   - Transform each phase in the Jenkins pipeline to a job or step in the YAML format.
+
+   - Adapt the syntax for each tool and action to match the chosen CI/CD system.
+ 
+4. Handle environment-specific configurations:
+
+   - Use YAML anchors and aliases to manage repetitive configurations.
+
+   - Implement conditional logic for different branches and environments.
+ 
+5. Manage secrets and variables:
+
+   - Use the CI/CD system's built-in secrets management.
+
+   - Define variables at the pipeline or job level as needed.
+ 
+6. Adapt tool-specific configurations:
+
+   - Translate Maven, SonarQube, Artifactory, and Checkmarx configurations to the new format.
+
+   - Find equivalent actions or plugins for Kaniko and Helm deployments.
+ 
+7. Implement deployment logic:
+
+   - Use the CI/CD system's deployment capabilities or integrate with external tools.
+ 
+Here's a basic example of how the structure might look in YAML (using a generic format):
+ 
+```yaml
+
+name: CMS File Processor CI/CD
+ 
+variables:
+
+  APPLICATION_NAME: gov-solutions-dmom-cms-file-processor
+
+  APPLICATION_VERSION: 0.0.6
+ 
+stages:
+
+  - build
+
+  - package
+
+  - deploy
+ 
+build:
+
+  stage: build
+
+  script:
+
+    - mvn clean install
+
+    - mvn test
+
+    # Add SonarQube, Artifactory, and Checkmarx steps
+ 
+package:
+
+  stage: package
+
+  script:
+
+    # Add Kaniko build steps
+ 
+deploy:
+
+  stage: deploy
+
+  script:
+
+    # Add Helm deployment steps
+
+  rules:
+
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+      variables:
+
+        ENVIRONMENT: dev
+
+    # Add rules for other branches and environments
+
+```
+ 
+Remember to adapt this structure and syntax to the specific YAML-based CI/CD system you choose. Each system has its own particularities and features that you'll need to consider during the conversion process.
+ 
+
+
+name: CMS File Processor CI/CD
+ 
+on:
+
+  push:
+
+    branches: [ feature/*, develop, pvs, stage, release/*, master ]
+
+  pull_request:
+
+    branches: [ develop, master ]
+ 
+env:
+
+  SHORT_APPLICATION_NAME: cms-file-processor
+
+  APPLICATION_NAME: gov-solutions-dmom-cms-file-processor
+
+  APPLICATION_VERSION: 0.0.6
+ 
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - uses: actions/checkout@v2
+
+    - name: Set up JDK 11
+
+      uses: actions/setup-java@v2
+
+      with:
+
+        java-version: '11'
+
+        distribution: 'adopt'
+
+    - name: Build with Maven
+
+      run: mvn clean install
+
+    - name: Run tests
+
+      run: mvn test
+
+    - name: SonarQube analysis
+
+      env:
+
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      run: |
+
+        mvn sonar:sonar \
+
+        -Dsonar.projectKey=${{ env.APPLICATION_NAME }} \
+
+        -Dsonar.organization=your-sonar-org \
+
+        -Dsonar.host.url=https://sonarcloud.io
+
+    - name: Upload artifact
+
+      uses: actions/upload-artifact@v2
+
+      with:
+
+        name: app-jar
+
+        path: target/*.jar
+ 
+  package:
+
+    needs: build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - uses: actions/checkout@v2
+
+    - name: Set up Docker Buildx
+
+      uses: docker/setup-buildx-action@v1
+
+    - name: Login to Registry
+
+      uses: docker/login-action@v1
+
+      with:
+
+        registry: ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}
+
+        username: ${{ secrets.REGISTRY_USERNAME }}
+
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    - name: Build and push
+
+      uses: docker/build-push-action@v2
+
+      with:
+
+        context: .
+
+        push: true
+
+        tags: |
+
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ env.APPLICATION_VERSION }}-${{ github.sha }}
+
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ env.APPLICATION_VERSION }}
+
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ github.sha }}
+ 
+  deploy:
+
+    needs: package
+
+    runs-on: ubuntu-latest
+
+    strategy:
+
+      matrix:
+
+        include:
+
+          - branch: feature/*
+
+            environment: dev
+
+          - branch: develop
+
+            environment: sys
+
+          - branch: pvs
+
+            environment: pvs
+
+          - branch: release/*
+
+            environment: rlse
+
+          - branch: master
+
+            environment: prod
+
+    if: contains(github.ref, matrix.branch)
+
+    steps:
+
+    - uses: actions/checkout@v2
+
+    - name: Set up Helm
+
+      uses: azure/setup-helm@v1
+
+      with:
+
+        version: v3.4.0
+
+    - name: Deploy to OpenShift
+
+      env:
+
+        KUBE_CONFIG: ${{ secrets[format('KUBE_CONFIG_{0}', matrix.environment)] }}
+
+      run: |
+
+        echo "$KUBE_CONFIG" > kubeconfig
+
+        export KUBECONFIG=./kubeconfig
+
+        helm upgrade --install ${{ env.APPLICATION_NAME }} ./${{ env.APPLICATION_NAME }}-pkg \
+
+          --namespace transaction-hub-${{ matrix.environment }} \
+
+          --set applicationName=${{ env.APPLICATION_NAME }} \
+
+          --set imageRepository=${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }} \
+
+          --set imageTag=${{ env.APPLICATION_VERSION }}-${{ github.sha }} \
+
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/values.yaml \
+
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/common.yaml \
+
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/cmsFileConfig.yaml \
+
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/dmom-cms-secrets.yaml
+
+=========================================================================================================================
+
+name: CMS File Processor CI/CD
+
+on:
+  push:
+    branches: [ feature/*, develop, pvs, stage, release/*, master ]
+  pull_request:
+    branches: [ develop, master ]
+
+env:
+  SHORT_APPLICATION_NAME: cms-file-processor
+  APPLICATION_NAME: gov-solutions-dmom-cms-file-processor
+  APPLICATION_VERSION: 0.0.6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up JDK 11
+      uses: actions/setup-java@v2
+      with:
+        java-version: '11'
+        distribution: 'adopt'
+    - name: Build with Maven
+      run: mvn clean install
+    - name: Run tests
+      run: mvn test
+    - name: SonarQube analysis
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      run: |
+        mvn sonar:sonar \
+        -Dsonar.projectKey=${{ env.APPLICATION_NAME }} \
+        -Dsonar.organization=your-sonar-org \
+        -Dsonar.host.url=https://sonarcloud.io
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: app-jar
+        path: target/*.jar
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+    - name: Login to Registry
+      uses: docker/login-action@v1
+      with:
+        registry: ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    - name: Build and push
+      uses: docker/build-push-action@v2
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ env.APPLICATION_VERSION }}-${{ github.sha }}
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ env.APPLICATION_VERSION }}
+          ${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }}:${{ github.sha }}
+
+  deploy:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - branch: feature/*
+            environment: dev
+          - branch: develop
+            environment: sys
+          - branch: pvs
+            environment: pvs
+          - branch: release/*
+            environment: rlse
+          - branch: master
+            environment: prod
+    if: contains(github.ref, matrix.branch)
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Helm
+      uses: azure/setup-helm@v1
+      with:
+        version: v3.4.0
+    - name: Deploy to OpenShift
+      env:
+        KUBE_CONFIG: ${{ secrets[format('KUBE_CONFIG_{0}', matrix.environment)] }}
+      run: |
+        echo "$KUBE_CONFIG" > kubeconfig
+        export KUBECONFIG=./kubeconfig
+        helm upgrade --install ${{ env.APPLICATION_NAME }} ./${{ env.APPLICATION_NAME }}-pkg \
+          --namespace transaction-hub-${{ matrix.environment }} \
+          --set applicationName=${{ env.APPLICATION_NAME }} \
+          --set imageRepository=${{ github.ref == 'refs/heads/master' && 'registry.cigna.com' || 'registry-dev.cigna.com' }}/transactionhub/${{ env.APPLICATION_NAME }} \
+          --set imageTag=${{ env.APPLICATION_VERSION }}-${{ github.sha }} \
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/values.yaml \
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/common.yaml \
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/cmsFileConfig.yaml \
+          -f ${{ env.APPLICATION_NAME }}-pkg/values/${{ matrix.environment }}/dmom-cms-secrets.yaml
+============================================================================================================================
